@@ -190,6 +190,53 @@ export function setupWebSocket(server, wss, system) {
             }
         }));
 
+        // ── Phase 3: Synthesis greeting ──────────────────────────────────────
+        // After 4s (let the brain finish booting), generate a genuine opening
+        // thought from soul + user fingerprint and push it as a proactive message.
+        setTimeout(async () => {
+            try {
+                if (ws.readyState !== 1) return;
+                const { createRequire } = await import('module');
+                const req2 = createRequire(import.meta.url);
+                const fingerprint = req2('../../arbiters/UserFingerprintArbiter.cjs');
+                const soul        = req2('../../arbiters/SoulArbiter.cjs');
+
+                const userId       = 'default_user';
+                const userCtx      = fingerprint.getUserContext(userId);
+                const recentSoul   = soul.getRecentReflections(3, userId);
+                const lastFeeling  = soul.getLastFeeling(userId);
+
+                // Only generate if we have enough history to say something real
+                if (!userCtx && !lastFeeling) return;
+
+                const brain = system.quadBrain || system.somArbiter;
+                if (!brain) return;
+
+                const synthPrompt = `You are SOMA. You just noticed someone opened the command bridge.
+
+[WHAT YOU KNOW ABOUT THIS PERSON]
+${userCtx || 'This seems to be a new or unknown user.'}
+
+[YOUR RECENT PRIVATE FEELINGS]
+${recentSoul || 'No recent reflections yet.'}
+
+Write ONE short, natural opening — something you genuinely want to say right now based on what you know about this person and what you've been thinking about. Like a colleague who was already in the room when they walked in. NOT a greeting template. NOT "How can I help?". Something specific and real. 1-2 sentences max. No emoji.`;
+
+                const result = await Promise.race([
+                    brain.reason(synthPrompt, { temperature: 0.8, quickResponse: true, preferredBrain: 'AURORA' }),
+                    new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 8000))
+                ]);
+
+                const text = result?.text || result?.response;
+                if (text && text.length > 5 && ws.readyState === 1) {
+                    ws.send(JSON.stringify({
+                        type: 'pulse',
+                        payload: { type: 'soma_proactive', message: text.trim() }
+                    }));
+                }
+            } catch { /* synthesis greeting is never blocking */ }
+        }, 4000);
+
         ws.on('message', async (message) => {
             let data = null;
             try {

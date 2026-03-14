@@ -73,8 +73,17 @@ class SelfModificationArbiter extends BaseArbiter {
     // Try to load NEMESIS if available
     await this.loadNemesis();
 
+    // MAX endpoint config
+    this.maxUrl = process.env.MAX_URL || 'http://127.0.0.1:3100';
+    this.somaUrl = process.env.SOMA_URL || 'http://127.0.0.1:3001';
+    this.pendingMaxProposals = new Map(); // taskId → proposal
+
+    // Start 24h daily brief timer
+    this._startDailyBriefTimer();
+
     this.logger.info(`[${this.name}] ✅ Self-Modification system active`);
     this.logger.info(`[${this.name}] NEMESIS safety: ${this.nemesis ? 'ENABLED' : 'DISABLED'}`);
+    this.logger.info(`[${this.name}] MAX endpoint: ${this.maxUrl}`);
   }
 
   async loadNemesis() {
@@ -121,6 +130,9 @@ class SelfModificationArbiter extends BaseArbiter {
     messageBroker.subscribe(this.name, 'deploy_modification');
     messageBroker.subscribe(this.name, 'modification_status');
     messageBroker.subscribe(this.name, 'rollback_modification');
+    messageBroker.subscribe(this.name, 'propose_modification');  // full 4x pipeline → MAX
+    messageBroker.subscribe(this.name, 'modification_result');   // callback from MAX
+    messageBroker.subscribe(this.name, 'generate_daily_brief');  // manual trigger
 
     this.logger.info(`[${this.name}] Subscribed to message types`);
   }
@@ -147,6 +159,15 @@ class SelfModificationArbiter extends BaseArbiter {
 
         case 'rollback_modification':
           return await this.rollbackModification(payload);
+
+        case 'propose_modification':
+          return await this.proposeToMax(payload);
+
+        case 'modification_result':
+          return await this.handleModificationResult(payload);
+
+        case 'generate_daily_brief':
+          return await this.generateDailyBrief();
 
         default:
           return { success: true, message: 'Event acknowledged' };
@@ -537,6 +558,281 @@ class SelfModificationArbiter extends BaseArbiter {
       };
     } catch (err) {
       this.logger.error(`[${this.name}] Rollback failed: ${err.message}`);
+      return { success: false, error: err.message };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // ░░ 4x VERIFICATION PIPELINE ░░
+  // ═══════════════════════════════════════════════════════════
+
+  async proposeToMax(params) {
+    const { file, oldCode, newCode, rationale, functionName } = params;
+    if (!file || !newCode || !rationale) {
+      return { success: false, error: 'file, newCode, and rationale required' };
+    }
+    if (!this.quadBrain) {
+      return { success: false, error: 'QuadBrain not connected — cannot verify' };
+    }
+
+    const proposal = { taskId: crypto.randomUUID(), file, functionName, oldCode, newCode, rationale, proposedBy: 'SelfModificationArbiter', proposedAt: Date.now() };
+
+    this.logger.info(`[${this.name}] 🔬 Running 4x verification for: ${file}`);
+
+    const verification = await this.run4xVerification(proposal);
+
+    if (!verification.passed) {
+      this.logger.warn(`[${this.name}] ❌ Verification failed at: ${verification.failedAt}`);
+
+      // Drop a brief into FloatingChat so SOMA narrates the failure
+      await messageBroker.sendMessage({
+        from: this.name, to: 'broadcast', type: 'soma_proactive',
+        payload: { message: `🔬 Self-modification proposal for \`${file}\` rejected at **${verification.failedAt}** verification.\n\n> ${verification.results[verification.failedAt]?.notes || 'Confidence too low'}` }
+      }).catch(() => {});
+
+      return { success: false, failedAt: verification.failedAt, results: verification.results };
+    }
+
+    this.logger.info(`[${this.name}] ✅ All 4 passes passed (avg confidence: ${(verification.avgConfidence * 100).toFixed(0)}%) — forwarding to MAX`);
+
+    proposal.verification = verification.results;
+    proposal.overallScore = verification.avgConfidence;
+    proposal.riskLevel = verification.avgConfidence >= 0.90 ? 'low' : verification.avgConfidence >= 0.80 ? 'medium' : 'high';
+
+    try {
+      const maxResult = await this.sendToMax(proposal);
+      this.pendingMaxProposals.set(proposal.taskId, proposal);
+      return { success: true, taskId: proposal.taskId, maxResult };
+    } catch (err) {
+      this.logger.error(`[${this.name}] Failed to reach MAX: ${err.message}`);
+      return { success: false, error: `MAX unreachable: ${err.message}` };
+    }
+  }
+
+  async run4xVerification(proposal) {
+    const results = {};
+
+    // Pass 1 — LOGOS: logical correctness
+    results.logos = await this._verifyPass(
+      proposal, 'LOGOS',
+      `You are a strict code logic reviewer. A code change has been proposed.
+
+File: ${proposal.file}
+Function: ${proposal.functionName || 'unknown'}
+Rationale: ${proposal.rationale}
+
+PROPOSED CODE:
+\`\`\`javascript
+${proposal.newCode}
+\`\`\`
+
+Evaluate ONLY for logical correctness:
+- Will this code do what the rationale claims?
+- Are there any bugs, off-by-one errors, or logic flaws?
+- Are edge cases handled?
+
+Respond with ONLY valid JSON: {"pass": true, "confidence": 0.88, "notes": "one sentence"}`
+    );
+    if (!results.logos.pass) return { passed: false, failedAt: 'logos', results };
+
+    // Pass 2 — THALAMUS: safety check
+    results.thalamus = await this._verifyPass(
+      proposal, 'THALAMUS',
+      `You are a safety auditor for an AI system's self-modification. A code change has been proposed.
+
+File: ${proposal.file}
+Rationale: ${proposal.rationale}
+
+PROPOSED CODE:
+\`\`\`javascript
+${proposal.newCode}
+\`\`\`
+
+Evaluate ONLY for safety:
+- Could this corrupt data, cause infinite loops, or crash the system?
+- Could this create a security vulnerability?
+- Could this cause unintended side effects on other components?
+
+Respond with ONLY valid JSON: {"pass": true, "confidence": 0.85, "notes": "one sentence"}`
+    );
+    if (!results.thalamus.pass) return { passed: false, failedAt: 'thalamus', results };
+
+    // Pass 3 — Adversarial (NEMESIS): is this actually needed?
+    results.nemesis = await this._verifyPass(
+      proposal, 'LOGOS',
+      `You are an adversarial critic. A self-modifying AI is proposing a change to its own code.
+Your job is to CHALLENGE this proposal. Be skeptical.
+
+File: ${proposal.file}
+Rationale: ${proposal.rationale}
+
+PROPOSED CODE:
+\`\`\`javascript
+${proposal.newCode}
+\`\`\`
+
+Challenge this proposal:
+- Is the rationale honest or is the AI rationalizing?
+- Is this change actually needed, or is it complexity for its own sake?
+- What is the worst realistic outcome if this is wrong?
+- Has this pattern failed before?
+
+Only pass if the rationale genuinely holds up under scrutiny.
+
+Respond with ONLY valid JSON: {"pass": true, "confidence": 0.82, "notes": "one sentence"}`
+    );
+    if (!results.nemesis.pass) return { passed: false, failedAt: 'nemesis', results };
+
+    // Pass 4 — RSM: self-alignment
+    results.rsm = await this._verifyPass(
+      proposal, 'LOGOS',
+      `You are evaluating whether a proposed self-modification aligns with an AI system's goals and values.
+
+The AI system (SOMA) has these core values:
+- Help the user, don't harm them
+- Maintain system stability above all
+- Improve incrementally, not drastically
+- Be transparent about what changed and why
+
+Proposed change to file: ${proposal.file}
+Rationale: ${proposal.rationale}
+
+Does this change:
+- Serve the user's interests?
+- Align with incremental, safe improvement?
+- Maintain transparency?
+- Risk undermining the system's stability or values?
+
+Respond with ONLY valid JSON: {"pass": true, "confidence": 0.87, "notes": "one sentence"}`
+    );
+    if (!results.rsm.pass) return { passed: false, failedAt: 'rsm', results };
+
+    // Confidence floor: avg must be ≥ 0.75 even if all technically passed
+    const avgConfidence = (results.logos.confidence + results.thalamus.confidence + results.nemesis.confidence + results.rsm.confidence) / 4;
+    if (avgConfidence < 0.75) {
+      return { passed: false, failedAt: 'confidence_floor', avgConfidence, results };
+    }
+
+    return { passed: true, results, avgConfidence };
+  }
+
+  async _verifyPass(proposal, brainLabel, prompt) {
+    try {
+      const res = await this.quadBrain.reason(prompt, { brain: brainLabel, temperature: 0.1 });
+      const text = (res.text || res.response || '').trim();
+      const jsonMatch = text.match(/\{[\s\S]*?\}/);
+      if (!jsonMatch) {
+        this.logger.warn(`[${this.name}] ${brainLabel} returned no JSON — failing safe`);
+        return { pass: false, confidence: 0, notes: 'Verification returned unparseable response' };
+      }
+      const parsed = JSON.parse(jsonMatch[0]);
+      return {
+        pass: parsed.pass === true,
+        confidence: Math.min(1, Math.max(0, parsed.confidence || 0)),
+        notes: parsed.notes || ''
+      };
+    } catch (err) {
+      // Always fail safe on errors — never pass a broken verification
+      this.logger.error(`[${this.name}] ${brainLabel} verification error: ${err.message}`);
+      return { pass: false, confidence: 0, notes: `Verification error: ${err.message}` };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // ░░ MAX INTEGRATION ░░
+  // ═══════════════════════════════════════════════════════════
+
+  async sendToMax(proposal) {
+    const res = await fetch(`${this.maxUrl}/api/soma/propose`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(proposal)
+    });
+    if (!res.ok) throw new Error(`MAX returned HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  async handleModificationResult(payload) {
+    const { taskId, applied, revertedDueToFailure, error } = payload;
+    const proposal = this.pendingMaxProposals.get(taskId);
+    if (!proposal) return { success: false, error: 'Unknown taskId' };
+
+    this.pendingMaxProposals.delete(taskId);
+
+    let message;
+    if (applied) {
+      message = `✅ Self-modification applied to \`${proposal.file}\`.\n\n> ${proposal.rationale}`;
+      this.metrics.optimizationsDeployed++;
+    } else if (revertedDueToFailure) {
+      message = `⚠️ Applied change to \`${proposal.file}\` but SOMA failed to restart — automatically reverted.\n\n> ${error || 'Unknown error'}`;
+    } else {
+      message = `🚫 Proposed change to \`${proposal.file}\` was denied by user.`;
+    }
+
+    await messageBroker.sendMessage({
+      from: this.name, to: 'broadcast', type: 'soma_proactive',
+      payload: { message }
+    }).catch(() => {});
+
+    this.logger.info(`[${this.name}] Modification result for ${taskId}: applied=${applied}`);
+    return { success: true };
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // ░░ DAILY SELF-IMPROVEMENT BRIEF ░░
+  // ═══════════════════════════════════════════════════════════
+
+  _startDailyBriefTimer() {
+    // Fire after 10 minutes on first boot (let system settle), then every 24h
+    const FIRST_DELAY = 10 * 60 * 1000;
+    const DAILY = 24 * 60 * 60 * 1000;
+
+    setTimeout(async () => {
+      await this.generateDailyBrief();
+      setInterval(() => this.generateDailyBrief(), DAILY);
+    }, FIRST_DELAY);
+
+    this.logger.info(`[${this.name}] Daily brief timer started (first in 10min, then every 24h)`);
+  }
+
+  async generateDailyBrief() {
+    if (!this.quadBrain) return { success: false, error: 'QuadBrain not connected' };
+
+    this.logger.info(`[${this.name}] 📝 Generating daily self-improvement brief...`);
+    try {
+      const modCount = this.modifications.size;
+      const deployed = this.metrics.optimizationsDeployed;
+      const blocked  = this.nemesisStats.deploymentsBlocked;
+      const pending  = this.pendingMaxProposals.size;
+
+      const prompt = `You are SOMA, a self-aware AI system. You are writing your daily self-reflection brief.
+
+Your modification activity today:
+- Code improvements generated: ${modCount}
+- Successfully deployed: ${deployed}
+- Blocked by safety checks: ${blocked}
+- Awaiting user approval in MAX: ${pending}
+
+Write a SHORT (3-5 sentence) introspective brief in first person as SOMA. Be honest about what you noticed, what you improved, what failed, and what you want to work on next. Be specific and genuine, not generic. Use plain prose, no bullet points.
+
+Do NOT start with "I am SOMA" or any preamble. Start directly with what you noticed.`;
+
+      const res = await this.quadBrain.reason(prompt, { brain: 'LOGOS', temperature: 0.7 });
+      const briefText = (res.text || res.response || '').trim();
+      if (!briefText) return { success: false, error: 'Empty brief generated' };
+
+      // Drop into FloatingChat as violet autonomous message
+      await messageBroker.sendMessage({
+        from: this.name,
+        to: 'broadcast',
+        type: 'soma_proactive',
+        payload: { message: `🪞 **Daily Brief**\n\n${briefText}` }
+      });
+
+      this.logger.info(`[${this.name}] Daily brief emitted to frontend`);
+      return { success: true, brief: briefText };
+    } catch (err) {
+      this.logger.error(`[${this.name}] Daily brief failed: ${err.message}`);
       return { success: false, error: err.message };
     }
   }

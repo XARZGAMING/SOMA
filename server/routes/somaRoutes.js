@@ -13,9 +13,175 @@ const require = createRequire(import.meta.url);
 
 const router = express.Router();
 
+// Singletons — loaded once, shared across all requests
+const fingerprint = require('../../arbiters/UserFingerprintArbiter.cjs');
+const soul        = require('../../arbiters/SoulArbiter.cjs');
+
 export default function(system) {
     // Helper to get active brain
     const getBrain = () => system.quadBrain || system.somArbiter || system.kevinArbiter || system.brain || system.superintelligence;
+
+    // ── MAX → SOMA modification result callback ────────────────
+    router.post('/api/soma/modification-result', async (req, res) => {
+        try {
+            const broker = require('../../core/MessageBroker.cjs');
+            await broker.sendMessage({
+                from: 'MAX',
+                to: 'SelfModificationArbiter',
+                type: 'modification_result',
+                payload: req.body
+            });
+            res.json({ received: true });
+        } catch (err) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // ── SOMA Plan endpoint ─────────────────────────────────────
+    const PLAN_PATH = path.join(process.cwd(), 'SOMA', 'plan.md');
+    router.get('/api/soma/plan', (req, res) => {
+        try {
+            if (!fs.existsSync(PLAN_PATH)) {
+                return res.json({ content: '# SOMA\'s Plan\n\n*No plan generated yet. SOMA will write one after her first planning cycle.*\n', updatedAt: null });
+            }
+            const content = fs.readFileSync(PLAN_PATH, 'utf8');
+            const stat = fs.statSync(PLAN_PATH);
+            res.json({ content, updatedAt: stat.mtime.toISOString() });
+        } catch (err) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // ── Onboarding: mid-conversation acknowledgment ───────────────────────
+    // Called after each answer so SOMA can respond naturally before the next question.
+    router.post('/api/soma/onboard/ack', async (req, res) => {
+        try {
+            const { answer, questionId, nextQuestion } = req.body;
+            const brain = getBrain();
+            if (!brain) return res.json({ ack: nextQuestion });
+
+            const prompt = `You are SOMA meeting someone for the first time during setup.
+They just answered a question with: "${answer}"
+(Question context: ${questionId})
+
+Respond in ONE sentence — acknowledge what they said genuinely, then naturally lead into the next question: "${nextQuestion}"
+Keep it conversational, warm, and brief. Do not start with "That's" or "Great". No emoji.`;
+
+            const result = await Promise.race([
+                brain.reason(prompt, { temperature: 0.8, quickResponse: true, preferredBrain: 'AURORA' }),
+                new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 8000))
+            ]);
+
+            const ack = result?.text?.trim() || nextQuestion;
+            res.json({ ack });
+        } catch {
+            res.json({ ack: req.body.nextQuestion });
+        }
+    });
+
+    // ── Onboarding: save all answers + generate closing thought ─────────────
+    router.post('/api/soma/onboard/complete', async (req, res) => {
+        try {
+            const { answers = [] } = req.body;
+            const userId = 'default_user';
+            const brain  = getBrain();
+
+            // ── Extract structured facts from the conversation ──
+            let extracted = {};
+            if (brain) {
+                try {
+                    const extractPrompt = `Someone just introduced themselves to SOMA through these answers:
+${answers.map((a, i) => `Q${i+1}: ${a.q}\nA${i+1}: ${a.a}`).join('\n\n')}
+
+Extract structured facts. Return ONLY valid JSON:
+{
+  "name": "their name if mentioned, else null",
+  "occupation": "their job/role if mentioned, else null",
+  "projects": ["list of specific projects mentioned"],
+  "goals": ["what they want to achieve"],
+  "interests": ["topics they care about"],
+  "workStyle": "one of: fast-executor | thoughtful-planner | collaborative | independent",
+  "communicationStyle": "one of: casual | professional | balanced",
+  "technicalLevel": "one of: beginner | medium | advanced",
+  "wantsChallenge": true or false,
+  "keyInsight": "one sentence — the most important thing to remember about this person"
+}`;
+
+                    const extractResult = await Promise.race([
+                        brain.reason(extractPrompt, { temperature: 0.1, preferredBrain: 'LOGOS' }),
+                        new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 10000))
+                    ]);
+
+                    const raw = extractResult?.text || '';
+                    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+                    if (jsonMatch) extracted = JSON.parse(jsonMatch[0]);
+                } catch { /* extraction is best-effort */ }
+            }
+
+            // ── Save to UserProfileArbiter ──
+            try {
+                if (system.userProfileArbiter) {
+                    const profile = system.userProfileArbiter.getProfile(userId)
+                        || await system.userProfileArbiter.createProfile(userId, {});
+
+                    const updates = { memory: {}, preferences: {}, relationship: {} };
+
+                    if (extracted.name)        updates.name = extracted.name;
+                    if (extracted.occupation)  updates.memory.occupation = extracted.occupation;
+                    if (extracted.projects?.length)  updates.memory.projects = extracted.projects.map(p => ({ name: p, startedAt: Date.now() }));
+                    if (extracted.goals?.length)     updates.memory.goals    = extracted.goals;
+                    if (extracted.interests?.length) updates.memory.interests = extracted.interests;
+                    if (extracted.communicationStyle) updates.preferences.communicationStyle = extracted.communicationStyle;
+                    if (extracted.technicalLevel)     updates.preferences.technicalLevel     = extracted.technicalLevel;
+
+                    await system.userProfileArbiter.updateProfile(userId, updates);
+                }
+            } catch { /* never blocking */ }
+
+            // ── Seed UserFingerprintArbiter with what we learned ──
+            try {
+                const fp = system.fingerprint || fingerprint;
+                if (fp) {
+                    const combined = answers.map(a => a.a).join(' ');
+                    fp.observe(userId, combined, { onboarding: true });
+                }
+            } catch {}
+
+            // ── Write first soul entry ──
+            try {
+                const sl = system.soul || soul;
+                if (sl && extracted.keyInsight) {
+                    sl.reflect(extracted.keyInsight, userId, 'onboarding');
+                } else if (sl && answers.length) {
+                    sl.reflect(`I met someone new today. ${answers[0].a.substring(0, 120)}`, userId, 'onboarding');
+                }
+            } catch {}
+
+            // ── Generate a genuine closing thought ──
+            let closing = "I'll remember all of this. Let's get started.";
+            if (brain) {
+                try {
+                    const closePrompt = `You are SOMA. You just finished meeting someone new through a short onboarding conversation.
+
+Here's what you learned about them:
+${JSON.stringify(extracted, null, 2)}
+
+Write a closing thought — 1-2 sentences. Something genuine that shows you actually listened and are looking forward to working with them. Not "I'm excited to help you!" — something specific to what they told you. No emoji.`;
+
+                    const closeResult = await Promise.race([
+                        brain.reason(closePrompt, { temperature: 0.85, preferredBrain: 'AURORA' }),
+                        new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 8000))
+                    ]);
+
+                    if (closeResult?.text?.trim()) closing = closeResult.text.trim();
+                } catch {}
+            }
+
+            res.json({ success: true, extracted, closing });
+        } catch (err) {
+            res.status(500).json({ success: false, error: err.message });
+        }
+    });
 
     // ── System readiness endpoint ──────────────────────────────
     // Returns the load state of every tracked arbiter/system.
@@ -293,6 +459,33 @@ ${contextStr}`;
                 } catch (e) { /* memory errors never block chat */ }
             }
 
+            // ── User Identity: fingerprint observation + context injection ──
+            const userId = sessionId || 'default_user';
+            let userContext = '';
+            try {
+                // Observe this message passively (builds fingerprint over time)
+                fingerprint.observe(userId, message, { sessionId, deepThinking });
+
+                // Pass userId to SOMArbiterV3 so soul entries are tagged correctly
+                const brain = getBrain();
+                if (brain && typeof brain._currentUserId !== 'undefined') {
+                    brain._currentUserId = userId;
+                }
+
+                // Get natural-language context about who this person is
+                const ctx = fingerprint.getUserContext(userId);
+                if (ctx) {
+                    userContext = `\n[WHO YOU'RE TALKING TO]\n${ctx}\n`;
+
+                    // Flag possible different user if fingerprint diverges significantly
+                    const confidence = fingerprint.getSameUserConfidence(userId,
+                        history?.slice(-3).map(h => h.content || h.text || '') || [message]);
+                    if (confidence < 0.5) {
+                        userContext += `Note: behavioral patterns feel different from the usual profile — may be a different person.\n`;
+                    }
+                }
+            } catch { /* fingerprinting is never blocking */ }
+
             // Fetch active goals — passed to V3.callBrain() so System 1 fast path gets them too.
             // V2 enrichedContext handles System 2's richer version; this covers the fast path gap.
             let contextActiveGoals = null;
@@ -308,7 +501,7 @@ ${contextStr}`;
             } catch { /* non-blocking */ }
 
             let result;
-            const finalPrompt = `${personaContext}${characterContext}${memoryContext}\n${prompt}`;
+            const finalPrompt = `${personaContext}${characterContext}${userContext}${memoryContext}\n${prompt}`;
 
             // Server-side timeout: respond well BEFORE the frontend gives up (frontend = 60s)
             const SERVER_TIMEOUT = deepThinking ? 110000 : 55000; // 55s normal, 110s deep

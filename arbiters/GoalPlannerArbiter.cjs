@@ -73,6 +73,7 @@ class GoalPlannerArbiter extends BaseArbiter {
     // Persistence
     this.dataDir = config.dataDir || path.join(process.cwd(), 'data');
     this.persistPath = path.join(this.dataDir, 'goals.json');
+    this.planPath = path.join(process.cwd(), 'SOMA', 'plan.md');
     this._dirty = false;
 
     // NEMESIS Phase 2.2: Reality check system
@@ -134,6 +135,9 @@ class GoalPlannerArbiter extends BaseArbiter {
     messageBroker.subscribe(this.name, 'update_goal_progress');
     messageBroker.subscribe(this.name, 'query_goals');
     messageBroker.subscribe(this.name, 'cancel_goal');
+    messageBroker.subscribe(this.name, 'approve_goal');
+    messageBroker.subscribe(this.name, 'reject_goal');
+    messageBroker.subscribe(this.name, 'question_response'); // New subscription for question responses
     
     // System observations for autonomous goal generation
     messageBroker.subscribe(this.name, 'velocity_report');
@@ -174,6 +178,16 @@ class GoalPlannerArbiter extends BaseArbiter {
         
         case 'cancel_goal':
           return await this.cancelGoal(payload.goalId, payload.reason);
+        
+        case 'approve_goal':
+          return await this.approveGoal(payload.goalId);
+
+        case 'reject_goal':
+          return await this.rejectGoal(payload.goalId, payload.reason);
+        
+        case 'question_response':
+          return await this.handleQuestionResponse(payload);
+        
         
         case 'velocity_report':
           return await this.handleVelocityReport(payload);
@@ -263,7 +277,8 @@ class GoalPlannerArbiter extends BaseArbiter {
         title: goalData.title,
         description: goalData.description || '',
         
-        status: 'pending',
+        status: (source === 'autonomous' || goalData.status === 'proposed') ? 'proposed' : 'pending', // Goals start as 'proposed' or 'pending'
+        approved: false, // All newly created goals require approval by default
         priority: goalData.priority || 50,
         
         metrics: goalData.metrics || {
@@ -335,8 +350,8 @@ class GoalPlannerArbiter extends BaseArbiter {
       this._dirty = true;
       this._saveToDisk();
 
-      // Start goal if no dependencies
-      if (goal.dependencies.length === 0 && goal.prerequisites.length === 0) {
+      // Start goal if no dependencies and not proposed
+      if (goal.status !== 'proposed' && goal.dependencies.length === 0 && goal.prerequisites.length === 0) {
         await this.startGoal(goal.id);
       }
       
@@ -353,11 +368,12 @@ class GoalPlannerArbiter extends BaseArbiter {
       throw new Error(`Goal not found: ${goalId}`);
     }
     
-    if (goal.status !== 'pending') {
-      return { success: false, reason: 'Goal not in pending state' };
+    if (goal.status !== 'pending' && goal.status !== 'proposed') {
+      return { success: false, reason: 'Goal not in pending or proposed state' };
     }
     
     goal.status = 'active';
+    goal.approved = true;
     goal.startedAt = Date.now();
     
     // Assign tasks if not already assigned
@@ -1256,9 +1272,24 @@ class GoalPlannerArbiter extends BaseArbiter {
     this.logger.info(`[${this.name}] Planning loop started (every ${this.planningIntervalHours}h)`);
   }
 
+  _readPlanMd() {
+    try {
+      if (fs.existsSync(this.planPath)) {
+        return fs.readFileSync(this.planPath, 'utf8');
+      }
+    } catch (_) {}
+    return null;
+  }
+
   async runPlanningCycle() {
     this.logger.info(`[${this.name}] 🧠 Running planning cycle...`);
-    
+
+    // Log plan context so SOMA has continuity
+    const plan = this._readPlanMd();
+    if (plan) {
+      this.logger.info(`[${this.name}] 📋 Current plan loaded (${plan.split('\n').length} lines)`);
+    }
+
     try {
       // Rebalance priorities
       await this.rebalancePriorities();
@@ -1304,7 +1335,18 @@ class GoalPlannerArbiter extends BaseArbiter {
       for (const goal of stalled) {
         this.logger.warn(`[${this.name}]    - ${goal.title} (${goal.metrics.progress}% progress)`);
         
-        // Could implement auto-escalation or re-assignment here
+        // Placeholder for proactive question: ask user about stalled goal
+        await this.proposeQuestion({
+          question: `Goal "${goal.title}" (${goal.id.slice(0, 8)}) seems stalled. What should I do?`,
+          options: ['Investigate why it\'s stalled', 'Cancel this goal', 'Re-prioritize for later'],
+          goalId: goal.id,
+          type: 'choice',
+          context: {
+            goalTitle: goal.title,
+            goalId: goal.id,
+            stalledDays: Math.floor((Date.now() - goal.startedAt) / 86400000)
+          }
+        });
       }
     }
   }
@@ -1385,8 +1427,67 @@ class GoalPlannerArbiter extends BaseArbiter {
       fs.writeFileSync(this.persistPath, JSON.stringify(snapshot, null, 2), 'utf8');
       this._dirty = false;
       this.logger.info(`[${this.name}] 💾 Saved ${this.goals.size} goals to disk`);
+      this._writePlanMd();
     } catch (err) {
       this.logger.error(`[${this.name}] Failed to save goals: ${err.message}`);
+    }
+  }
+
+  _writePlanMd() {
+    try {
+      const now = new Date();
+      const ts = now.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+
+      const allGoals = Array.from(this.goals.values());
+      const proposed  = allGoals.filter(g => g.status === 'proposed').sort((a, b) => b.priority - a.priority);
+      const active    = allGoals.filter(g => g.status === 'active').sort((a, b) => b.priority - a.priority);
+      const pending   = allGoals.filter(g => g.status === 'pending').sort((a, b) => b.priority - a.priority);
+      const completed = this.completedGoals.slice(0, 20);
+      const failed    = this.failedGoals.slice(0, 10);
+
+      const fmtGoal = (g, checked = false) => {
+        const box = checked ? '[x]' : '[ ]';
+        const pct = g.metrics?.progress != null ? ` — ${g.metrics.progress.toFixed(0)}%` : '';
+        const desc = g.description ? `\n  > ${g.description.substring(0, 120)}` : '';
+        return `- ${box} **${g.title}** *(priority: ${g.priority})${pct}*${desc}`;
+      };
+
+      let md = `# SOMA's Plan\n\n*Last updated: ${ts}*\n\n`;
+
+      if (proposed.length) {
+        md += `## ⏳ Awaiting Approval\n${proposed.map(g => fmtGoal(g)).join('\n')}\n\n`;
+      }
+      if (active.length) {
+        md += `## 🔥 Active\n${active.map(g => fmtGoal(g)).join('\n')}\n\n`;
+      }
+      if (pending.length) {
+        md += `## 🕐 Queued\n${pending.map(g => fmtGoal(g)).join('\n')}\n\n`;
+      }
+      if (completed.length) {
+        md += `## ✅ Completed\n${completed.map(g => fmtGoal(g, true)).join('\n')}\n\n`;
+      }
+      if (failed.length) {
+        md += `## ❌ Rejected / Failed\n${failed.map(g => `- ~~${g.title}~~ *(${g.metadata?.rejectionReason || g.status})*`).join('\n')}\n\n`;
+      }
+
+      md += `---\n*${this.goals.size} goals tracked · ${active.length} active · Tension: ${Math.round((this.lastTension || 0) * 100)}%*\n`;
+
+      // Ensure SOMA/ directory exists
+      const dir = path.dirname(this.planPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+      fs.writeFileSync(this.planPath, md, 'utf8');
+
+      // Notify frontend
+      messageBroker.sendMessage({
+        from: this.name,
+        to: 'broadcast',
+        type: 'plan_updated',
+        payload: { content: md, updatedAt: now.toISOString() }
+      }).catch(() => {});
+
+    } catch (err) {
+      this.logger.error(`[${this.name}] Failed to write plan.md: ${err.message}`);
     }
   }
 
@@ -1465,6 +1566,109 @@ class GoalPlannerArbiter extends BaseArbiter {
     } catch (err) {
       this.logger.error(`[${this.name}] Failed to load goals: ${err.message} — starting fresh`);
     }
+  }
+
+  async approveGoal(goalId) {
+    const goal = this.goals.get(goalId);
+    if (!goal) {
+      return { success: false, error: 'Goal not found' };
+    }
+
+    if (goal.status !== 'proposed') {
+      return { success: false, reason: 'Goal is not in a proposed state' };
+    }
+
+    // Set approved and change status to active
+    goal.approved = true;
+    goal.status = 'active'; // Status is changed to active before calling startGoal
+
+    this._dirty = true;
+    this._saveToDisk();
+
+    await messageBroker.sendMessage({
+      from: this.name,
+      to: 'broadcast',
+      type: 'goal_approved',
+      payload: { goalId: goal.id, goal }
+    });
+
+    this.logger.info(`[${this.name}] ✅ Approved and activated goal: ${goal.title} (${goal.id.slice(0, 8)})`);
+
+    // Now start the goal, which will handle assigned tasks etc.
+    // Ensure startGoal is idempotent and doesn't re-assign if already active.
+    return await this.startGoal(goal.id);
+  }
+
+  async rejectGoal(goalId, reason = 'Rejected by user') {
+    const goal = this.goals.get(goalId);
+    if (!goal) {
+      return { success: false, error: 'Goal not found' };
+    }
+
+    if (goal.status !== 'proposed') {
+      return { success: false, reason: 'Goal is not in a proposed state' };
+    }
+
+    goal.status = 'rejected';
+    goal.approved = false;
+    goal.metadata.rejectionReason = reason;
+
+    this.activeGoals.delete(goalId); // Remove from active set
+    this.failedGoals.unshift(goal); // Treat as failed for archival
+
+    this._dirty = true;
+    this._saveToDisk();
+
+    await messageBroker.sendMessage({
+      from: this.name,
+      to: 'broadcast',
+      type: 'goal_rejected',
+      payload: { goalId: goal.id, goal, reason }
+    });
+
+    this.logger.info(`[${this.name}] 🚫 Rejected goal: ${goal.title} (${goal.id.slice(0, 8)}) - ${reason}`);
+
+    return { success: true, goalId: goal.id };
+  }
+
+  async proposeQuestion(questionPayload) {
+    if (!questionPayload || !questionPayload.question) {
+      this.logger.error(`[${this.name}] proposeQuestion called with invalid payload.`);
+      return { success: false, error: 'Invalid question payload' };
+    }
+
+    const questionId = crypto.randomUUID();
+    const questionEvent = {
+      from: this.name,
+      to: 'broadcast', // Frontend will listen to this
+      type: 'proactive_question',
+      payload: {
+        questionId,
+        timestamp: Date.now(),
+        ...questionPayload
+      }
+    };
+
+    await messageBroker.sendMessage(questionEvent);
+    this.logger.info(`[${this.name}] ❓ Proposed question: ${questionPayload.question} (ID: ${questionId.slice(0, 8)})`);
+
+    return { success: true, questionId };
+  }
+
+  async handleQuestionResponse(payload) {
+    const { questionId, response } = payload;
+    this.logger.info(`[${this.name}] Received response for question ${questionId.slice(0, 8)}: "${response}"`);
+
+    // Here you would typically process the response.
+    // For example, update a goal's metadata, trigger a new action,
+    // or log it for later analysis.
+    // Since this is a placeholder, we'll just log it.
+
+    // If the question was related to a stalled goal, we might now
+    // take action based on the 'response'.
+    // e.g., if response is 'Cancel this goal', call this.cancelGoal(goalId, 'User requested cancel');
+
+    return { success: true, message: 'Question response processed' };
   }
 
   // ═══════════════════════════════════════════════════════════

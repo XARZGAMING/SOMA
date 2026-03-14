@@ -35,6 +35,10 @@ import BeliefNetworkViewer from './components/BeliefNetworkViewer';
 import DreamInsights from './components/DreamInsights';
 import TheoryOfMindPanel from './components/TheoryOfMindPanel';
 import SystemDiagnosticsApp from './components/SystemDiagnosticsApp';
+import SomaStatusStrip from './components/SomaStatusStrip';
+import ProposedGoalModal from './components/ProposedGoalModal';
+import SomaPlanViewer from './components/SomaPlanViewer';
+import OnboardingWizard from './components/OnboardingWizard';
 // import EnhancedKnowledgeSystem from './components/EnhancedKnowledgeSystem';
 
 // STEVE & Workflow Integration
@@ -433,6 +437,16 @@ const SomaCommandBridge = () => {
 
   const [isConnected, setIsConnected] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(() => !localStorage.getItem('soma_onboarded'));
+
+  // SOMA Status Strip State
+  const [activeGoal, setActiveGoal] = useState('Monitor System Health');
+  const [goalProgress, setGoalProgress] = useState(50); // Example: 0-100%
+  const [tensionLevel, setTensionLevel] = useState(30); // Example: 0-100%
+  const [lastToolUsed, setLastToolUsed] = useState('system_monitor');
+  const [lastToolTimestamp, setLastToolTimestamp] = useState(Date.now());
+  const [proposedGoals, setProposedGoals] = useState([]); // New state for proposed goals
+  const [activeQuestion, setActiveQuestion] = useState(null); // New state for proactive questions
 
   // UI State
   const [showProcessModal, setShowProcessModal] = useState(false);
@@ -625,7 +639,10 @@ const SomaCommandBridge = () => {
   }, [isConnected]);
 
   useEffect(() => {
-    if (!isConnected) return;
+    // Only poll GPU/network when connected AND the dashboard is actually visible.
+    // These queries wake hardware (nvidia-smi / WMI adapter stats), so running
+    // them while the user is in a different module is pointless churn.
+    if (!isConnected || activeModule !== 'core') return;
 
     let isMounted = true;
     const pollSystemTelemetry = async () => {
@@ -663,12 +680,12 @@ const SomaCommandBridge = () => {
     };
 
     pollSystemTelemetry();
-    const interval = setInterval(pollSystemTelemetry, 5000);
+    const interval = setInterval(pollSystemTelemetry, 30000); // 30s — hardware queries don't need sub-second freshness
     return () => {
       isMounted = false;
       clearInterval(interval);
     };
-  }, [isConnected]);
+  }, [isConnected, activeModule]);
 
   // Persist personality changes to backend (debounced)
   const personalityTimerRef = useRef(null);
@@ -764,9 +781,35 @@ const SomaCommandBridge = () => {
       }, ...prev].slice(0, 100));
     });
 
+    somaBackend.on('goal_created', (payload) => {
+      const { goal } = payload;
+      if (goal && goal.status === 'proposed') {
+        setProposedGoals(prev => {
+          // Prevent duplicates if the event fires multiple times
+          if (!prev.some(pg => pg.id === goal.id)) {
+            toast.info(`📝 New Proposed Goal: ${goal.title}`, { theme: 'dark', autoClose: 8000 });
+            return [...prev, goal];
+          }
+          return prev;
+        });
+      }
+    });
+
+    somaBackend.on('proactive_question', (payload) => {
+      // payload will contain: questionId, question, options (optional), goalId (optional), type, context
+      setActiveQuestion(payload);
+      toast.info(`❓ SOMA has a question for you!`, { theme: 'dark', autoClose: 8000 });
+      // Optionally, highlight the chat badge or open the chat
+    });
+
     // --- NERVOUS SYSTEM: Unified Pulse Listener ---
     somaBackend.on('pulse', (payload) => {
-      const { system, agents, brains, knowledge, events, neuralLoad, contextWindow, systemDetail, counts } = payload;
+      const { system, agents, brains, knowledge, events, neuralLoad, contextWindow, systemDetail, counts, currentGoal, goalProgress, tension } = payload;
+
+      // Update SOMA Status Strip data
+      if (currentGoal) setActiveGoal(currentGoal);
+      if (goalProgress !== undefined) setGoalProgress(goalProgress);
+      if (tension !== undefined) setTensionLevel(tension);
 
       // 1. Host Metrics
       if (system) {
@@ -918,6 +961,13 @@ const SomaCommandBridge = () => {
     somaBackend.on('soma_activity', (payload) => {
       const { source, description, output, status } = payload;
       if (status !== 'ok') return;
+
+      // Update SOMA Status Strip for last tool used
+      if (source) {
+        setLastToolUsed(source);
+        setLastToolTimestamp(Date.now());
+      }
+
       const summary = output
         ? `[${source}] ${description} → ${output.substring(0, 120)}`
         : `[${source}] ${description}`;
@@ -1246,6 +1296,54 @@ const SomaCommandBridge = () => {
     return null;
   };
 
+  const handleApproveGoal = useCallback(async (goalId) => {
+    try {
+      await somaBackend.sendMessage({
+        from: 'SomaCommandBridge',
+        to: 'GoalPlannerArbiter',
+        type: 'approve_goal',
+        payload: { goalId }
+      });
+      toast.success('Goal Approved!', { theme: 'dark' });
+      setProposedGoals(prev => prev.filter(goal => goal.id !== goalId));
+    } catch (error) {
+      console.error('Failed to approve goal:', error);
+      toast.error('Failed to approve goal', { theme: 'dark' });
+    }
+  }, []);
+
+  const handleRejectGoal = useCallback(async (goalId, reason = 'User rejected') => {
+    try {
+      await somaBackend.sendMessage({
+        from: 'SomaCommandBridge',
+        to: 'GoalPlannerArbiter',
+        type: 'reject_goal',
+        payload: { goalId, reason }
+      });
+      toast.info('Goal Rejected', { theme: 'dark' });
+      setProposedGoals(prev => prev.filter(goal => goal.id !== goalId));
+    } catch (error) {
+      console.error('Failed to reject goal:', error);
+      toast.error('Failed to reject goal', { theme: 'dark' });
+    }
+  }, []);
+
+  const handleSendQuestionResponse = useCallback(async (questionId, response) => {
+    try {
+      await somaBackend.sendMessage({
+        from: 'SomaCommandBridge',
+        to: 'GoalPlannerArbiter', // Assuming GoalPlannerArbiter processes the question
+        type: 'question_response',
+        payload: { questionId, response }
+      });
+      toast.success('Response sent to SOMA!', { theme: 'dark' });
+      setActiveQuestion(null); // Clear the active question after response
+    } catch (error) {
+      console.error('Failed to send question response:', error);
+      toast.error('Failed to send response', { theme: 'dark' });
+    }
+  }, []);
+
   // ------------------------------------------
   // RESTORED HANDLERS (Cognitive)
   // ------------------------------------------
@@ -1338,6 +1436,7 @@ const SomaCommandBridge = () => {
   // ------------------------------------------
   return (
     <div className="flex h-screen ct-background text-zinc-200 font-sans selection:bg-white/20">
+      {showOnboarding && <OnboardingWizard onComplete={() => setShowOnboarding(false)} />}
       {showProcessModal && <ProcessMonitor agents={agents} onClose={() => setShowProcessModal(false)} />}
       {showSystemDetail && <SystemDetailModal metricId={showSystemDetail} systemMetrics={systemMetrics} onClose={() => setShowSystemDetail(null)} />}
       <SystemDiagnosticsApp
@@ -1386,11 +1485,7 @@ const SomaCommandBridge = () => {
           </div>
           {!sidebarCollapsed && (
             <>
-              <div className="flex items-center space-x-2 mb-2">
-                <div className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-500 shadow-[0_0_8px_#10b981]' : 'bg-amber-500 shadow-[0_0_8px_#f59e0b]'} ${isConnected ? '' : 'animate-pulse'}`} />
-                <span className="text-[10px] text-zinc-500 font-bold tracking-widest uppercase">{isConnected ? 'Neural Link Active' : 'Neural Link Severed'}</span>
-              </div>
-              <p className="text-zinc-600 text-[9px] font-mono uppercase tracking-[0.2em]">Bridge Terminal v7.4</p>
+            <p className="text-zinc-600 text-[9px] font-mono uppercase tracking-[0.2em]">Bridge Terminal v7.4</p>
             </>
           )}
         </div>
@@ -1405,6 +1500,7 @@ const SomaCommandBridge = () => {
 
             { id: 'simulation', label: 'Simulation', icon: Box, color: 'orange' },
 
+            { id: 'plan', label: "SOMA's Plan", icon: Target, color: 'violet' },
             { id: 'analytics', label: 'Analytics', icon: BarChart3, color: 'indigo' },
             { id: 'forecaster', label: 'Forecaster', icon: TrendingUp, color: 'indigo' },
             { id: 'mission_control', label: 'Mission Control', icon: CircleDollarSign, color: 'rose' },
@@ -1426,6 +1522,17 @@ const SomaCommandBridge = () => {
             </button>
           ))}
         </nav>
+        {/* SOMA Status Strip */}
+        <SomaStatusStrip
+          activeGoal={activeGoal}
+          goalProgress={goalProgress}
+          tensionLevel={tensionLevel}
+          lastToolUsed={lastToolUsed}
+          lastToolTimestamp={lastToolTimestamp}
+          isSomaBusy={isSomaBusy}
+          isConnected={isConnected}
+          sidebarCollapsed={sidebarCollapsed}
+        />
       </div>
 
       {/* Main content */}
@@ -1800,6 +1907,13 @@ const SomaCommandBridge = () => {
 
 
 
+
+        {/* PLAN MODULE */}
+        {activeModule === 'plan' && (
+          <div className="h-full -m-6">
+            <SomaPlanViewer isConnected={isConnected} />
+          </div>
+        )}
 
         {/* ANALYTICS MODULE */}
         {activeModule === 'analytics' && (
@@ -2381,7 +2495,24 @@ const SomaCommandBridge = () => {
 
       {/* Global SOMA Chat - Available on all tabs except terminal */}
       {activeModule !== 'terminal' && (
-        <FloatingChat isServerRunning={isConnected} isBusy={isSomaBusy} onSendMessage={handleFloatingChatMessage} activeModule={activeModule} />
+        <FloatingChat
+          isServerRunning={isConnected}
+          isBusy={isSomaBusy}
+          onSendMessage={handleFloatingChatMessage}
+          activeModule={activeModule}
+          activeQuestion={activeQuestion}
+          onSendQuestionResponse={handleSendQuestionResponse}
+          tensionLevel={tensionLevel}
+        />
+      )}
+
+      {proposedGoals.length > 0 && (
+        <ProposedGoalModal
+          proposedGoals={proposedGoals}
+          onApprove={handleApproveGoal}
+          onReject={handleRejectGoal}
+          onClose={() => setProposedGoals([])} // Allows user to dismiss the modal without action
+        />
       )}
 
       {/* Character Lab Modal */}

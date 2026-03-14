@@ -26,6 +26,11 @@ import MnemonicIndexerArbiter from '../../arbiters/MnemonicIndexerArbiter.js';
 const HybridSearchArbiter = require('../../arbiters/HybridSearchArbiter.cjs');
 const TimekeeperArbiter = require('../../arbiters/TimekeeperArbiter.cjs');
 const GoalPlannerArbiter = require('../../arbiters/GoalPlannerArbiter.cjs');
+const SelfModificationArbiter = require('../../arbiters/SelfModificationArbiter.cjs');
+
+// Phase 1-3: User identity + Soul
+const soul        = require('../../arbiters/SoulArbiter.cjs');
+const fingerprint = require('../../arbiters/UserFingerprintArbiter.cjs');
 
 // ──────────────────────────────────────────
 // PHASE B: Core Specialists (use system.quadBrain, etc.)
@@ -672,6 +677,31 @@ export async function loadExtendedSystems(system) {
             })
         );
     }
+
+    // ── SelfModificationArbiter: 4x verification pipeline + MAX forwarding ──
+    ext.selfModification = await safeLoad('SelfModificationArbiter', async () => {
+        const arbiter = new SelfModificationArbiter({
+            name: 'SelfModificationArbiter',
+            sandboxMode: false,    // real mode — MAX handles the safety
+            requireApproval: true
+        });
+        await arbiter.initialize();
+        if (system.quadBrain) arbiter.setQuadBrain(system.quadBrain);
+        return arbiter;
+    });
+
+    // ── Soul + UserFingerprint: boot early so they're ready for first chat ──
+    await safeLoad('SoulArbiter', async () => {
+        soul.initialize();
+        system.soul = soul;
+        return soul;
+    });
+
+    await safeLoad('UserFingerprintArbiter', async () => {
+        fingerprint.initialize();
+        system.fingerprint = fingerprint;
+        return fingerprint;
+    });
 
     // ── ToolCreator + SkillWatcher: Always load (lightweight, critical for self-expansion) ──
     ext.toolCreator = await safeLoad('ToolCreatorArbiter', () =>
